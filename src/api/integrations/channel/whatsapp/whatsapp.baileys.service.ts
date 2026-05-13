@@ -251,6 +251,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private presenceIntervalId: ReturnType<typeof setInterval> | null = null;
+  private presenceDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -265,6 +267,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.clearPresenceCyclingInterval();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -424,6 +427,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.clearPresenceCyclingInterval();
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -513,6 +517,10 @@ export class BaileysStartupService extends ChannelStartupService {
         profilePictureUrl: this.instance.profilePictureUrl,
         ...this.stateConnection,
       });
+
+      if (this.localSettings.alwaysOnline !== true) {
+        this.schedulePhoneNotificationReceiptRecovery();
+      }
     }
 
     if (connection === 'connecting') {
@@ -573,7 +581,66 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private clearPresenceCyclingInterval(): void {
+    if (this.presenceIntervalId !== null) {
+      clearInterval(this.presenceIntervalId);
+      this.presenceIntervalId = null;
+    }
+    if (this.presenceDebounceTimer !== null) {
+      clearTimeout(this.presenceDebounceTimer);
+      this.presenceDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Baileys 7 (messages-recv): `sendActiveReceipts` segue `connection.update.isOnline`, definido em
+   * `sendPresenceUpdate('available'|'unavailable')` (chats.ts). Com `sendActiveReceipts === true`,
+   * recibos de mensagens recebidas não usam `type: 'inactive'` e o WhatsApp suprime push/som no telefone.
+   * Workaround alinhado a Baileys#2246 + evolution-api#512.
+   */
+  private async awaitSelfPresenceUnavailable(): Promise<void> {
+    if (this.localSettings.alwaysOnline === true || !this.client) {
+      return;
+    }
+    try {
+      await this.client.sendPresenceUpdate('unavailable');
+    } catch {
+      // socket a fechar / race no reconnect
+    }
+  }
+
+  private pushSelfPresenceUnavailable(): void {
+    void this.awaitSelfPresenceUnavailable().catch(() => undefined);
+  }
+
+  /** Rajadas após `open` — o perfil `me.name` pode ainda não estar pronto no 1.º tick; múltiplos envios aumentam hipótese de `inactive` receipts. */
+  private schedulePhoneNotificationReceiptRecovery(): void {
+    if (this.localSettings.alwaysOnline === true) {
+      return;
+    }
+    const delaysMs = [400, 2000, 5000, 12_000, 20_000, 30_000];
+    for (const ms of delaysMs) {
+      setTimeout(() => void this.awaitSelfPresenceUnavailable().catch(() => undefined), ms);
+    }
+  }
+
+  /** Após receber mensagem, o Baileys pode marcar actividade; reforça offline com debounce. */
+  private debounceSelfPresenceUnavailableAfterInbound(): void {
+    if (this.localSettings.alwaysOnline === true) {
+      return;
+    }
+    if (this.presenceDebounceTimer !== null) {
+      clearTimeout(this.presenceDebounceTimer);
+    }
+    this.presenceDebounceTimer = setTimeout(() => {
+      this.presenceDebounceTimer = null;
+      this.pushSelfPresenceUnavailable();
+    }, 500);
+  }
+
   private async createClient(number?: string): Promise<WASocket> {
+    this.clearPresenceCyclingInterval();
+
     this.instance.authState = await this.defineAuthState();
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
@@ -696,6 +763,14 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+
+    /**
+     * Ciclo de presença — mantém `sendActiveReceipts` falso no Baileys (recibos inactive → push no telefone).
+     * Intervalo 30s alinhado a workaround comunitário (Baileys#2246).
+     */
+    this.presenceIntervalId = setInterval(() => {
+      this.pushSelfPresenceUnavailable();
+    }, 30_000);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -1321,6 +1396,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.localSettings.readStatus && received.key.id === 'status@broadcast') {
             await this.client.readMessages([received.key]);
+          }
+
+          if (!received.key.fromMe) {
+            this.debounceSelfPresenceUnavailableAfterInbound();
           }
 
           if (
@@ -2553,6 +2632,8 @@ export class BaileysStartupService extends ChannelStartupService {
           isIntegration,
         });
       }
+
+      this.pushSelfPresenceUnavailable();
 
       return messageRaw;
     } catch (error) {
